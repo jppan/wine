@@ -134,6 +134,19 @@ struct ios_get_fex_arena_params
     ULONG64 end;    /* OUT: exclusive */
 };
 
+/* iOS-Madeira: copy an exact PE-image write to the corresponding JIT-pool
+ * RW alias.  Hybrid metadata is patched after the image was copied, and the
+ * executing pool copy must see those dispatcher slots before any CRT code can
+ * run.  Keep this a small, versioned request rather than relying on the broad
+ * NtProtect-time section scan. */
+struct ios_sync_image_write_params
+{
+    unsigned int size;      /* sizeof(struct) */
+    unsigned int version;   /* 1: copy; 2: enter/leave exact-write scope */
+    ULONG64 addr;           /* v1: source; v2: 1 enter, 0 leave */
+    ULONG64 length;         /* v1: bytes; v2: 0 */
+};
+
 enum ntdll_unix_funcs
 {
     unix_load_so_dll,
@@ -151,6 +164,7 @@ enum ntdll_unix_funcs
     unix_ios_jit_alias_probe,   /* ml631 — APPEND ONLY (see note above) */
     unix_ios_mono_bridge_ptr,   /* ml648 — APPEND ONLY: inserting renumbers every later ordinal */
     unix_ios_get_fex_arena,     /* ml800 — APPEND ONLY */
+    unix_ios_sync_image_write,  /* APPEND ONLY: exact PE -> JIT-pool slot sync */
 };
 
 extern unixlib_handle_t __wine_unixlib_handle;

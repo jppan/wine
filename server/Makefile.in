@@ -1,4 +1,5 @@
 PROGRAMS = wineserver
+EXTRAINCL = -I$(top_srcdir)/../build/ntdll-unix/shims
 
 SOURCES = \
 	async.c \

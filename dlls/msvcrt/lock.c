@@ -37,6 +37,16 @@ typedef struct
 
 static LOCKTABLEENTRY lock_table[ _TOTAL_LOCKS ];
 
+/* iOS-Madeira ml2025: ARM64EC native code executes from a relocated JIT-pool
+ * copy of the PE image.  ucrtbase's DllMain initializes lock_table in the
+ * loader mapping, but the pool copy was made earlier and still has a zeroed
+ * _LOCKTAB_LOCK entry.  The normal lazy path then calls _lock(17) from
+ * _lock(17) forever.  Keep a pool-local bootstrap state so either image can
+ * safely initialize its own table lock on first use. */
+static LONG lock_table_bootstrap;
+static const char lock_table_bootstrap_revision[] __attribute__((used)) =
+    "[ucrt-lock] ml2025 pool-safe";
+
 static inline void msvcrt_mlock_set_entry_initialized( int locknum, BOOL initialized )
 {
   lock_table[ locknum ].bInit = initialized;
@@ -56,6 +66,28 @@ static inline void msvcrt_uninitialize_mlock( int locknum )
   msvcrt_mlock_set_entry_initialized( locknum, FALSE );
 }
 
+static void msvcrt_ensure_lock_table_lock(void)
+{
+  LONG state;
+
+  if (lock_table[_LOCKTAB_LOCK].bInit) return;
+
+  state = InterlockedCompareExchange( &lock_table_bootstrap, 1, 0 );
+  if (!state)
+  {
+    /* This is the only path that may initialize the table lock without first
+     * acquiring it.  Publishing bInit happens inside initialize_mlock; state=2
+     * is the release point for competing first users. */
+    msvcrt_initialize_mlock( _LOCKTAB_LOCK );
+    InterlockedExchange( &lock_table_bootstrap, 2 );
+  }
+  else
+  {
+    while (InterlockedCompareExchange( &lock_table_bootstrap, 2, 2 ) != 2)
+      YieldProcessor();
+  }
+}
+
 /**********************************************************************
  *     msvcrt_init_mt_locks (internal)
  *
@@ -69,6 +101,8 @@ void msvcrt_init_mt_locks(void)
 
   TRACE( "initializing mtlocks\n" );
 
+  InterlockedExchange( &lock_table_bootstrap, 1 );
+
   /* Initialize the table */
   for( i=0; i < _TOTAL_LOCKS; i++ )
   {
@@ -77,6 +111,7 @@ void msvcrt_init_mt_locks(void)
 
   /* Initialize our lock table lock */
   msvcrt_initialize_mlock( _LOCKTAB_LOCK );
+  InterlockedExchange( &lock_table_bootstrap, 2 );
 }
 
 /**********************************************************************
@@ -85,6 +120,12 @@ void msvcrt_init_mt_locks(void)
 void CDECL _lock( int locknum )
 {
   TRACE( "(%d)\n", locknum );
+
+  /* Normally DllMain initialized this entry.  An ARM64EC pool copy can retain
+   * the pre-DllMain zero image, so bootstrap it instead of recursively asking
+   * the missing table lock to initialize itself. */
+  if (locknum == _LOCKTAB_LOCK && !lock_table[locknum].bInit)
+    msvcrt_ensure_lock_table_lock();
 
   /* If the lock doesn't exist yet, create it */
   if( lock_table[ locknum ].bInit == FALSE )
@@ -160,4 +201,5 @@ void msvcrt_free_locks(void)
       msvcrt_uninitialize_mlock( i );
     }
   }
+  InterlockedExchange( &lock_table_bootstrap, 0 );
 }

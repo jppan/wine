@@ -5560,11 +5560,25 @@ void (WINAPI *pWow64PrepareForException)( EXCEPTION_RECORD *rec, CONTEXT *contex
 
 static void init_wow64( CONTEXT *context )
 {
+    NTSTATUS status;
+
+    /* The native WoW64 path never reaches loader_init's alloc_thread_tls().
+     * Give every native thread a TLS vector before loading/attaching the CPU
+     * backend. alloc_tls_slot() can then populate it when xtajit is loaded,
+     * including the libc++ exception state used by __cxa_get_globals. New
+     * threads copy the registered templates before BTCpuThreadInit runs. */
+    if (!NtCurrentTeb()->ThreadLocalStoragePointer && (status = alloc_thread_tls()))
+    {
+        ERR( "native WoW64 TLS initialization failed, status %lx\n", status );
+        if (!imports_fixup_done) NtTerminateProcess( GetCurrentProcess(), status );
+        RtlLeaveCriticalSection( &loader_section );
+        for (;;) NtTerminateThread( GetCurrentThread(), status );
+    }
+
     if (!imports_fixup_done)
     {
         HMODULE wow64;
         WINE_MODREF *wm;
-        NTSTATUS status;
         static const WCHAR wow64_path[] = L"C:\\windows\\system32\\wow64.dll";
 
         build_wow64_main_module();

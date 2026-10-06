@@ -572,6 +572,98 @@ void *arm64ec_redirect_ptr( HMODULE module, void *ptr, const IMAGE_ARM64EC_METAD
 
 static void arm64x_check_call(void);
 
+/* iOS-Madeira ml2026: arm64ec_update_hybrid_metadata writes a handful of
+ * dispatcher slots in a writable section.  Each slot is mirrored explicitly
+ * by update_hybrid_pointer(), so the generic NtProtect whole-page sync must be
+ * suppressed around those writes.  Otherwise its 16 KiB copy replaces live
+ * pool-local CRT state with the pre-DllMain PE image (ucrtbase's _environ was
+ * observed becoming NULL immediately before FEX LookupCache construction). */
+static const char arm64ec_exact_write_revision[] __attribute__((used)) =
+    "[hybrid-exact] ml2026 preserve-pool-data";
+
+static void arm64ec_exact_write_scope( BOOL enter )
+{
+    struct ios_sync_image_write_params params =
+    {
+        sizeof(params), 2, enter ? 1 : 0, 0
+    };
+    NTSTATUS status = WINE_UNIX_CALL( unix_ios_sync_image_write, &params );
+
+    if (status)
+        ERR( "exact-write scope %s failed: %lx\n", enter ? "enter" : "leave", status );
+}
+
+/* ARM64EC runtime DLLs carry their own copies of the hybrid dispatcher
+ * globals. The loader patches them before DllMain, but llvm-mingw's CRT/TLS
+ * initialization can subsequently restore their zero-initialized image data.
+ * Patch once during early loader setup and again after every DllMain has run,
+ * immediately before FEX ThreadInit can call a libc++ exit thunk. */
+static void arm64ec_repatch_loaded_modules( const char *phase, HMODULE backend )
+{
+    LIST_ENTRY *list = &RtlGetCurrentPeb()->LdrData->InLoadOrderModuleList;
+    LIST_ENTRY *entry;
+    void *no_redirect, *dispatch_fptr, *dispatch_ret;
+
+    /* iOS-Madeira ml2027: pProcessInit crosses into FEX and can return through
+     * the other ntdll image view.  The pre-CRT pass then sees the pool-local
+     * dispatcher globals, while the post-CRT continuation may see the still
+     * zero PE-side copies.  Never use those view-local globals as the source
+     * of truth: reacquire all three exports from this pseudo-process's active
+     * backend before every repair pass. */
+    no_redirect = RtlFindExportedRoutineByName( backend, "ExitToX64" );
+    dispatch_fptr = RtlFindExportedRoutineByName( backend, "DispatchJump" );
+    dispatch_ret = RtlFindExportedRoutineByName( backend, "RetToEntryThunk" );
+    if (!no_redirect || !dispatch_fptr || !dispatch_ret)
+    {
+        ERR( "[hybrid-refresh] ml2027 phase=%s backend=%p MISSING exports "
+             "no_redirect=%p fptr=%p ret=%p -- refusing to publish null dispatchers\n",
+             phase, backend, no_redirect, dispatch_fptr, dispatch_ret );
+        return;
+    }
+    __os_arm64x_dispatch_call_no_redirect = no_redirect;
+    __os_arm64x_dispatch_fptr = dispatch_fptr;
+    __os_arm64x_dispatch_ret = dispatch_ret;
+    ERR( "[hybrid-refresh] ml2027 phase=%s backend=%p no_redirect=%p fptr=%p ret=%p\n",
+         phase, backend, no_redirect, dispatch_fptr, dispatch_ret );
+
+    for (entry = list->Flink; entry != list; entry = entry->Flink)
+    {
+        LDR_DATA_TABLE_ENTRY *mod_entry =
+            CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
+        const IMAGE_ARM64EC_METADATA *mod_metadata =
+            arm64ec_get_module_metadata( mod_entry->DllBase );
+        void **slot, **pool_slot;
+        void *before, *pool_before;
+
+        if (!mod_metadata) continue;
+        /* Re-patching ntdll has unrelated IAT-sync side effects; its private
+         * dispatcher globals are installed by the ntdll loader path. */
+        if (mod_entry->BaseDllName.Buffer &&
+            !wcscmp( mod_entry->BaseDllName.Buffer, L"ntdll.dll" ))
+        {
+            ERR( "arm64ec_repatch_loaded_modules(%s): SKIP ntdll\n", phase );
+            continue;
+        }
+
+        slot = get_rva( mod_entry->DllBase,
+                        mod_metadata->__os_arm64x_dispatch_call_no_redirect );
+        pool_slot = p_ios_jit_translate_addr ? xlate_ios_jit( slot ) : slot;
+        before = mod_metadata->__os_arm64x_dispatch_call_no_redirect ? *slot : NULL;
+        pool_before = mod_metadata->__os_arm64x_dispatch_call_no_redirect ? *pool_slot : NULL;
+
+        arm64ec_update_hybrid_metadata( mod_entry->DllBase,
+                                        RtlImageNtHeader( mod_entry->DllBase ),
+                                        mod_metadata );
+
+        ERR( "[hybrid-repatch] ml2023 phase=%s module=%s no_redirect "
+             "pe=%p:%p->%p pool=%p:%p->%p\n", phase,
+             debugstr_w(mod_entry->BaseDllName.Buffer), slot, before,
+             mod_metadata->__os_arm64x_dispatch_call_no_redirect ? *slot : NULL,
+             pool_slot, pool_before,
+             mod_metadata->__os_arm64x_dispatch_call_no_redirect ? *pool_slot : NULL );
+    }
+}
+
 /*******************************************************************
  *         arm64ec_process_init
  */
@@ -599,10 +691,6 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
      * crashes inside arm64x_check_call. */
     RtlGetCurrentPeb()->WerRegistrationData = arm64x_check_call;
 
-    __os_arm64x_dispatch_call_no_redirect = RtlFindExportedRoutineByName( module, "ExitToX64" );
-    __os_arm64x_dispatch_fptr = RtlFindExportedRoutineByName( module, "DispatchJump" );
-    __os_arm64x_dispatch_ret = RtlFindExportedRoutineByName( module, "RetToEntryThunk" );
-
     /* The dispatcher globals were 0 when EVERY ARM64EC module's
      * arm64ec_update_hybrid_metadata ran (because the globals only get set
      * here, AFTER xtajit64 finishes loading — but kernel32/ucrtbase/kernelbase
@@ -618,35 +706,7 @@ NTSTATUS arm64ec_process_init_dispatchers( HMODULE module )
      * slots happen to already be functional (the EC dispatcher slots that
      * matter for ntdll are written elsewhere during ntdll's special
      * loader-init path, not via arm64ec_update_hybrid_metadata). */
-    {
-        LIST_ENTRY *list = &RtlGetCurrentPeb()->LdrData->InLoadOrderModuleList;
-        LIST_ENTRY *entry;
-        void *self_module = (void *)NtCurrentTeb()->Peb->ImageBaseAddress;  /* unused but harmless */
-        (void)self_module;
-        void *ntdll_base = (void *)RtlGetCurrentPeb();
-        (void)ntdll_base;
-        for (entry = list->Flink; entry != list; entry = entry->Flink)
-        {
-            LDR_DATA_TABLE_ENTRY *mod_entry =
-                CONTAINING_RECORD( entry, LDR_DATA_TABLE_ENTRY, InLoadOrderLinks );
-            const IMAGE_ARM64EC_METADATA *mod_metadata =
-                arm64ec_get_module_metadata( mod_entry->DllBase );
-            if (!mod_metadata) continue;
-            /* Skip ntdll — re-patch breaks it via iOS NtProtect-sync side
-             * effects, and ntdll doesn't need it anyway. Match by base name. */
-            if (mod_entry->BaseDllName.Buffer &&
-                !wcscmp( mod_entry->BaseDllName.Buffer, L"ntdll.dll" ))
-            {
-                ERR( "arm64ec_process_init_dispatchers: SKIP ntdll re-patch\n" );
-                continue;
-            }
-            ERR( "arm64ec_process_init_dispatchers: re-patching %s metadata\n",
-                 debugstr_w(mod_entry->BaseDllName.Buffer) );
-            arm64ec_update_hybrid_metadata( mod_entry->DllBase,
-                                            RtlImageNtHeader( mod_entry->DllBase ),
-                                            (IMAGE_ARM64EC_METADATA *)mod_metadata );
-        }
-    }
+    arm64ec_repatch_loaded_modules( "pre-crt", module );
 
     /* ml755: print xtajit64's VA band selector log, which nothing else can.
      *
@@ -886,8 +946,6 @@ NTSTATUS arm64ec_process_init( HMODULE module )
 {
     NTSTATUS status = STATUS_SUCCESS;
     CHPEV2_PROCESS_INFO *info = RtlGetCurrentPeb()->ChpeV2ProcessInfo;
-    (void)module;
-
     enter_syscall_callback();
     if (pProcessInit) status = pProcessInit();
     ERR( "arm64ec_process_init: pProcessInit -> %lx (info=%p)\n", status, info );
@@ -897,6 +955,13 @@ NTSTATUS arm64ec_process_init( HMODULE module )
             emulated_processor_features[i] = pBTCpu64IsProcessorFeaturePresent( i );
         status = create_cross_process_work_list( info );
         ERR( "arm64ec_process_init: create_cross_process_work_list -> %lx\n", status );
+    }
+    if (!status)
+    {
+        /* Dependency DllMains/TLS callbacks have now run. Reassert the
+         * per-module hybrid globals after CRT initialization and before FEX's
+         * ThreadInit constructs C++ state through libc++.dll. */
+        arm64ec_repatch_loaded_modules( "post-crt", module );
     }
     if (!status && pThreadInit)
     {
@@ -945,13 +1010,36 @@ IMAGE_ARM64EC_METADATA *arm64ec_get_module_metadata( HMODULE module )
 
 static void update_hybrid_pointer( void *module, const IMAGE_SECTION_HEADER *sec, UINT rva, void *ptr )
 {
+    void **slot;
+
     if (!rva) return;
 
     if (rva < sec->VirtualAddress || rva >= sec->VirtualAddress + sec->Misc.VirtualSize)
         ERR( "rva %x outside of section %s (%lx-%lx)\n", rva,
              sec->Name, sec->VirtualAddress, sec->VirtualAddress + sec->Misc.VirtualSize );
     else
-        *(void **)get_rva( module, rva ) = ptr;
+    {
+        slot = get_rva( module, rva );
+
+        /* On iOS, executable PE images run from a JIT-pool copy.  Translate
+         * the target first, then copy this exact slot through the pool's RW
+         * alias.  The old whole-section NtProtect sync left libc++.dll's
+         * dispatch_call_no_redirect slot zero and its exit thunk branched to
+         * address 0 during FEX ThreadInit. */
+        if (p_ios_jit_translate_addr) ptr = xlate_ios_jit( ptr );
+        *slot = ptr;
+        if (p_ios_jit_translate_addr)
+        {
+            struct ios_sync_image_write_params params =
+            {
+                sizeof(params), 1, (ULONG64)(ULONG_PTR)slot, sizeof(*slot)
+            };
+            NTSTATUS status = WINE_UNIX_CALL( unix_ios_sync_image_write, &params );
+            if (status)
+                ERR( "exact JIT sync failed for module %p rva %x slot %p value %p: %lx\n",
+                     module, rva, slot, ptr, status );
+        }
+    }
 }
 
 /*******************************************************************
@@ -975,6 +1063,7 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
             void *base = get_rva( module, sec->VirtualAddress );
             SIZE_T size = sec->Misc.VirtualSize;
 
+            arm64ec_exact_write_scope( TRUE );
             NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, PAGE_READWRITE, &protect_old );
 
 #define SET_FUNC(func,val) update_hybrid_pointer( module, sec, metadata->func, val )
@@ -995,6 +1084,7 @@ void arm64ec_update_hybrid_metadata( void *module, IMAGE_NT_HEADERS *nt,
 #undef SET_FUNC
 
             NtProtectVirtualMemory( NtCurrentProcess(), &base, &size, protect_old, &protect_old );
+            arm64ec_exact_write_scope( FALSE );
             return;
         }
     }
@@ -1369,10 +1459,12 @@ NTSTATUS SYSCALL_API NtAllocateVirtualMemoryEx( HANDLE process, PVOID *ret, SIZE
  *
  * Two things here. The classification log is unconditional (sampled) because every probe in
  * this path was a one-shot cap that had been spent long before the storm started, which is
- * why 2,025 of those 2,085 iterations were invisible. The re-entry itself is OPT-IN
- * (MADEIRA_EC_CONTINUE_SIM=1): it is the documented mechanism, and it is exactly what
- * dispatch_emulation() below does with an already-x64 context, but it changes the resume path
- * for every guest SEH continue and has not been confirmed on device.
+ * why 2,025 of those 2,085 iterations were invisible.  ml2034 makes re-entry the default:
+ * it is the documented mechanism, and it is exactly what dispatch_emulation() below does
+ * with an already-x64 context.  The Elden Ring main-menu trace proved that leaving it off
+ * drops a valid guest continue (NtContinue returns STATUS_INVALID_PARAMETER) and turns a
+ * handled breakpoint into an unhandled 0x80000003 process exit.  Keep =0 as a diagnostic
+ * opt-out; =1 remains accepted for compatibility with existing madeira-env files.
  */
 static int ec_continue_sim_enabled(void)
 {
@@ -1382,9 +1474,11 @@ static int ec_continue_sim_enabled(void)
     {
         UNICODE_STRING nm, val;
         WCHAR buf[8];
+        NTSTATUS status;
         RtlInitUnicodeString( &nm, L"MADEIRA_EC_CONTINUE_SIM" );
         val.Buffer = buf; val.Length = 0; val.MaximumLength = sizeof(buf);
-        on = (!RtlQueryEnvironmentVariable_U( NULL, &nm, &val ) && val.Length && buf[0] == '1');
+        status = RtlQueryEnvironmentVariable_U( NULL, &nm, &val );
+        on = status || !val.Length || buf[0] != '0';
     }
     return on;
 }
@@ -1451,7 +1545,7 @@ static BOOL ec_continue_into_simulation( CONTEXT *context, BOOLEAN alertable )
              (void *)(ULONG_PTR)ec->Pc, (int)rep );
 
     if (ec_sample( n ))
-        ERR( "[ec-continue] ml1020 #%d rep=%d Rip=%p Rsp=%p is_ec=%d alertable=%d insim=%u sim_knob=%d "
+        ERR( "[ec-continue] ml2034 default-sim-resume #%d rep=%d Rip=%p Rsp=%p is_ec=%d alertable=%d insim=%u sim_knob=%d "
              "-> %s (#N counts EVERY NtContinue process-wide, sampled; rep= is this thread+Rip)\n",
              (int)n, (int)rep, (void *)(ULONG_PTR)ec->Pc, (void *)(ULONG_PTR)ec->Sp,
              (int)is_ec, (int)alertable, cpu ? cpu->InSimulation : 0, ec_continue_sim_enabled(),
@@ -1488,9 +1582,9 @@ NTSTATUS SYSCALL_API NtContinue( CONTEXT *context, BOOLEAN alertable )
         static LONG fail_n;
         LONG n = InterlockedIncrement( &fail_n );
         if (ec_sample( n ))
-            ERR( "[ec-continue] ml1020 RETURNED #%d status=%08x Rip=%p Rsp=%p is_ec=%d -- the "
+            ERR( "[ec-continue] ml2034 RETURNED #%d status=%08x Rip=%p Rsp=%p is_ec=%d -- the "
                  "continue was DROPPED; the caller will now re-raise the same record "
-                 "(set MADEIRA_EC_CONTINUE_SIM=1 to re-enter simulation directly instead)\n",
+                 "(simulation resume is default; MADEIRA_EC_CONTINUE_SIM=0 is only a diagnostic opt-out)\n",
                  (int)n, (unsigned int)status,
                  (void *)(ULONG_PTR)((ARM64EC_NT_CONTEXT *)context)->Pc,
                  (void *)(ULONG_PTR)((ARM64EC_NT_CONTEXT *)context)->Sp,
@@ -2466,7 +2560,7 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
             NTSTATUS st = syscall_NtProtectVirtualMemory( process, addr_ptr, size_ptr, new_prot, old_prot );
 
             execreq_n++;
-            ERR( "[exec-req] #%d addr=%p size=%p new_prot=%lx -> status=%08x%s%s\n",
+            ERR( "[exec-req] ml2020 #%d addr=%p size=%p new_prot=%lx -> status=%08x%s%s\n",
                  execreq_n, req_addr, (void *)req_size, new_prot, (unsigned)st,
                  st ? "  <== FAILED" : "",
                  is_current ? "" : "  (cross-process)" );
@@ -2476,6 +2570,17 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
             else if (pNotifyMemoryProtect
                      && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
                 pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, st );
+            /* This diagnostic fast path performs the syscall itself and returns
+             * before the common epilogue below.  Balance the successful
+             * enter_syscall_callback() above just as the ordinary path does.
+             *
+             * Without this, the first sampled executable protect leaves
+             * InSyscallCallback set.  Later loader protects then take the raw
+             * syscall escape at the top of this function and never notify FEX,
+             * so newly executable pages are absent from XIntervals and die as
+             * "NoExec instruction in entry block".  Elden Ring exposed this
+             * at 0x144b16025 after making 0x144b16000 executable. */
+            leave_syscall_callback();
             return st;
         }
     }
