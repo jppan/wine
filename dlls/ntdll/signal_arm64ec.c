@@ -2480,6 +2480,40 @@ static BOOL ios_bulk_protect_suppressed( const char *via, void *addr, SIZE_T siz
     return TRUE;
 }
 
+/* iOS-Madeira ml2051: do not make FEX throw away translated code when a
+ * one-host-page executable protect did not change the state FEX tracks.
+ *
+ * Some engines repeatedly apply PAGE_EXECUTE_READ to pages that are already
+ * PAGE_EXECUTE_READ.  Wine must still perform the syscall (the Unix side has
+ * JIT-image synchronisation side effects), but NotifyMemoryProtect used to
+ * invalidate every translated block in the range anyway.  The device trace
+ * showed the result directly: vprot before=25 after=25 alongside tens of
+ * thousands of real recompiles per ten seconds.
+ *
+ * old_prot is authoritative for a single rounded host page.  For a larger
+ * range Windows returns only the first page's old protection, so retain the
+ * conservative notification.  A writable/non-writable transition is likewise
+ * real to FEX's SMC tracker, and PAGE_GUARD must always keep its normal path. */
+static BOOL ios_fex_redundant_exec_protect( void *addr, SIZE_T size, ULONG old_prot, ULONG new_prot )
+{
+    static LONG skipped;
+    const ULONG exec_mask = PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    const ULONG write_mask = PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    LONG n;
+
+    if (!size || size > 0x4000) return FALSE;
+    if ((old_prot | new_prot) & PAGE_GUARD) return FALSE;
+    if (!(old_prot & exec_mask) || !(new_prot & exec_mask)) return FALSE;
+    if (!!(old_prot & write_mask) != !!(new_prot & write_mask)) return FALSE;
+
+    n = InterlockedIncrement( &skipped );
+    if (n <= 8 || !(n & 0x3fff))
+        ERR( "[protect-noop] ml2051 #%ld %p+%p old=%lx new=%lx; kept FEX translations\n",
+             n, addr, (void *)size, old_prot, new_prot );
+    return TRUE;
+}
+
 NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SIZE_T *size_ptr,
                                              ULONG new_prot, ULONG *old_prot )
 {
@@ -2568,7 +2602,9 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
             if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
                                                              *addr_ptr, *size_ptr, 2, new_prot, st );
             else if (pNotifyMemoryProtect
-                     && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
+                     && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot )
+                     && !(NT_SUCCESS(st) && old_prot &&
+                          ios_fex_redundant_exec_protect( *addr_ptr, *size_ptr, *old_prot, new_prot )))
                 pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, st );
             /* This diagnostic fast path performs the syscall itself and returns
              * before the common epilogue below.  Balance the successful
@@ -2590,7 +2626,9 @@ NTSTATUS SYSCALL_API NtProtectVirtualMemory( HANDLE process, PVOID *addr_ptr, SI
     if (!is_current) send_cross_process_notification( process, CrossProcessPostVirtualProtect,
                                                       *addr_ptr, *size_ptr, 2, new_prot, status );
     else if (pNotifyMemoryProtect
-             && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot ))
+             && !ios_bulk_protect_suppressed( "cur-post", *addr_ptr, *size_ptr, new_prot )
+             && !(NT_SUCCESS(status) && old_prot &&
+                  ios_fex_redundant_exec_protect( *addr_ptr, *size_ptr, *old_prot, new_prot )))
         pNotifyMemoryProtect( *addr_ptr, *size_ptr, new_prot, TRUE, status );
 
     leave_syscall_callback();
